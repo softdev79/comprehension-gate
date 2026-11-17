@@ -1,0 +1,5 @@
+# Only gate/llm.py needs a model SDK; evidence, policy and the hook are standard library.
+# Default provider (GATE_PROVIDER=openai): Amazon Bedrock's OpenAI-compatible endpoint.
+openai>=1.40
+# Optional, for GATE_PROVIDER=anthropic:
+# anthropic>=1.0

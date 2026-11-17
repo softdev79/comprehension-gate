@@ -1,0 +1,80 @@
+# Copy to .github/workflows/ in the repository you want to gate.
+# Runs from the default branch (issue_comment), so a pull request cannot change it.
+name: Comprehension gate - sign and attest
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+  id-token: write
+  attestations: write
+
+jobs:
+  attest:
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/sign')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.issue.number }}
+      COMMENTER: ${{ github.event.comment.user.login }}
+    steps:
+      - name: Check signer and grading status
+        id: check
+        run: |
+          author=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json author --jq .author.login)
+          sha=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+          if [ "$COMMENTER" != "$author" ]; then
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Only the pull request author (@$author) can sign the comprehension questionnaire."
+            exit 1
+          fi
+          graded=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/status" \
+            --jq '[.statuses[] | select(.context == "comprehension-gate/graded")][0] | "\(.state) \(.description)"')
+          state=${graded%% *}
+          if [ "$state" != "success" ]; then
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Cannot sign yet: the answers on the latest commit have not passed grading."
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "summary=${graded#* }" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.check.outputs.sha }}
+
+      - uses: actions/checkout@v4
+        with:
+          repository: softdev79/comprehension-gate
+          path: .gate-tool
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build attestation predicate
+        id: predicate
+        env:
+          SHA: ${{ steps.check.outputs.sha }}
+          SUMMARY: ${{ steps.check.outputs.summary }}
+        run: |
+          python .gate-tool/comprehension_gate.py predicate --pr "$PR" --head-sha "$SHA" \
+            --signer "$COMMENTER" --grade-summary "$SUMMARY" --out "$RUNNER_TEMP/predicate.json"
+
+      - name: Sign with Sigstore
+        uses: actions/attest@v2
+        with:
+          subject-name: comprehension/pr-${{ github.event.issue.number }}/answers.md
+          subject-digest: ${{ steps.predicate.outputs.subject_digest }}
+          predicate-type: https://comprehension-gate.dev/attestation/v1
+          predicate-path: ${{ runner.temp }}/predicate.json
+
+      - name: Release the gate
+        env:
+          SHA: ${{ steps.check.outputs.sha }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=success \
+            -f context=comprehension-gate -f description="Signed by @$COMMENTER"
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Comprehension gate released: signed by @$COMMENTER for commit \`$SHA\`."

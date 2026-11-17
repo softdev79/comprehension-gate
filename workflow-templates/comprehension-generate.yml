@@ -1,0 +1,107 @@
+# Copy to .github/workflows/ in the repository you want to gate.
+# Replace softdev79/comprehension-gate with where you host this project.
+name: Comprehension gate - generate
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: comprehension-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    # Fork pull requests get no secrets; they are skipped in this version.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.pull_request.number }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      BEFORE: ${{ github.event.before }}
+      AFTER: ${{ github.event.after }}
+      ACTION: ${{ github.event.action }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      # Run only when code changed. A push that touches nothing but .comprehension/
+      # (the owner's answers) is handled by the grade workflow instead.
+      - name: Did code change?
+        id: route
+        run: |
+          if [ "$ACTION" != "synchronize" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if ! changed=$(git diff --name-only "$BEFORE" "$AFTER" 2>/dev/null); then
+            changed="force-push"   # history rewritten: treat as a code change
+          fi
+          if echo "$changed" | grep -qv '^\.comprehension/'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.route.outputs.run == 'true'
+        with:
+          repository: softdev79/comprehension-gate
+          path: .gate-tool
+
+      - uses: actions/setup-python@v5
+        if: steps.route.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Generate questionnaire
+        if: steps.route.outputs.run == 'true'
+        id: gen
+        env:
+          # Model endpoint. Key and project are secrets; URL and model are repository variables.
+          GATE_PROVIDER: openai
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_PROJECT_ID: ${{ secrets.OPENAI_PROJECT_ID }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          MODEL_ID: ${{ vars.MODEL_ID || 'openai.gpt-oss-120b' }}
+        run: |
+          pip install -q -r .gate-tool/requirements.txt
+          python .gate-tool/comprehension_gate.py generate --pr "$PR" --base "origin/$BASE_REF" --head HEAD
+
+      # Pushes made with the workflow token do not trigger workflows, so this cannot loop.
+      - name: Commit questionnaire to the pull request branch
+        if: steps.route.outputs.run == 'true' && steps.gen.outputs.questionnaire_sha256 != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .comprehension
+          git commit -m "comprehension-gate: questionnaire for PR #$PR" || echo "nothing to commit"
+          git push origin "HEAD:$HEAD_REF"
+
+      - name: Post questionnaire link and mark the gate pending
+        if: steps.route.outputs.run == 'true' && steps.gen.outputs.questionnaire_sha256 != ''
+        env:
+          QSHA: ${{ steps.gen.outputs.questionnaire_sha256 }}
+          RISK: ${{ steps.gen.outputs.risk }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          {
+            echo "### Comprehension gate: questionnaire ready ($RISK risk)"
+            echo
+            echo "Fill in \`.comprehension/pr-$PR/answers.md\` on this branch and push it."
+            echo "Answers are graded automatically; once they pass, the author comments \`/sign\`."
+            echo
+            echo "<!-- comprehension-gate questionnaire-sha256: $QSHA -->"
+          } > "$RUNNER_TEMP/comment.md"
+          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md"
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$sha" \
+            -f state=pending -f context=comprehension-gate \
+            -f description="Waiting for the owner's answers"

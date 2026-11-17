@@ -1,0 +1,110 @@
+# Copy to .github/workflows/ in the repository you want to gate.
+name: Comprehension gate - grade
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: comprehension-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  grade:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.pull_request.number }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      BEFORE: ${{ github.event.before }}
+      AFTER: ${{ github.event.after }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      # Grade only a push that changed answers.md and no code.
+      - name: Did only the answers change?
+        id: route
+        run: |
+          run=false
+          if changed=$(git diff --name-only "$BEFORE" "$AFTER" 2>/dev/null); then
+            if echo "$changed" | grep -qx "\.comprehension/pr-$PR/answers\.md" \
+               && ! echo "$changed" | grep -qv '^\.comprehension/'; then
+              run=true
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.route.outputs.run == 'true'
+        with:
+          repository: softdev79/comprehension-gate
+          path: .gate-tool
+
+      - uses: actions/setup-python@v5
+        if: steps.route.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Grade answers
+        if: steps.route.outputs.run == 'true'
+        id: grade
+        env:
+          # Model endpoint. Key and project are secrets; URL and model are repository variables.
+          GATE_PROVIDER: openai
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_PROJECT_ID: ${{ secrets.OPENAI_PROJECT_ID }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          MODEL_ID: ${{ vars.MODEL_ID || 'openai.gpt-oss-120b' }}
+        run: |
+          pip install -q -r .gate-tool/requirements.txt
+          # The questionnaire hash the gate published; a questionnaire edited by hand will not match.
+          expected=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | .body' \
+            | grep -o 'questionnaire-sha256: [0-9a-f]\{64\}' | tail -1 | cut -d' ' -f2)
+          if [ -z "$expected" ]; then
+            echo "No published questionnaire hash found for this pull request." >&2
+            exit 2
+          fi
+          set +e
+          python .gate-tool/comprehension_gate.py grade --pr "$PR" --base "origin/$BASE_REF" --head HEAD \
+            --expect-questionnaire-sha "$expected" --out "$RUNNER_TEMP/gate"
+          code=$?
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" = "2" ]; then exit 2; fi
+
+      - name: Report result
+        if: steps.route.outputs.run == 'true' && always() && steps.grade.outputs.code != ''
+        env:
+          CODE: ${{ steps.grade.outputs.code }}
+          PERCENT: ${{ steps.grade.outputs.percent }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          [ -f "$RUNNER_TEMP/gate/result.md" ] && gh pr comment "$PR" --body-file "$RUNNER_TEMP/gate/result.md"
+          if [ "$CODE" = "0" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=success \
+              -f context=comprehension-gate/graded -f description="Score ${PERCENT}%"
+            gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending \
+              -f context=comprehension-gate -f description="Passed grading; waiting for /sign"
+          else
+            gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=failure \
+              -f context=comprehension-gate/graded -f description="Score ${PERCENT}% - see follow-up questions"
+            gh api "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=failure \
+              -f context=comprehension-gate -f description="Answers did not pass yet"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: steps.route.outputs.run == 'true' && always()
+        with:
+          name: comprehension-grade-pr-${{ github.event.pull_request.number }}
+          path: ${{ runner.temp }}/gate/
+          if-no-files-found: ignore

@@ -1,0 +1,6 @@
+{
+  "name": "comprehension-gate",
+  "version": "0.1.0",
+  "description": "Records which lines Claude Code wrote and when, so the comprehension gate in CI can report AI vs human authorship and time spent.",
+  "author": { "name": "comprehension-gate" }
+}

@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  comprehension-gate as a GitHub App on AWS free-tier serverless:
+  Lambda Function URL (webhook) -> SQS FIFO -> Lambda container (worker) -> Bedrock,
+  with state in DynamoDB and secrets in SSM Parameter Store.
+
+Parameters:
+  AppId:
+    Type: String
+    Description: GitHub App ID (a number, from the App's settings page)
+  BotLogin:
+    Type: String
+    Description: The App's bot login, e.g. my-comprehension-gate[bot]
+  OpenAIBaseUrl:
+    Type: String
+    Default: https://bedrock-mantle.us-east-1.api.aws/v1
+  OpenAIProjectId:
+    Type: String
+    Default: ""
+    NoEcho: true
+  ModelId:
+    Type: String
+    Default: openai.gpt-oss-120b
+  ParamPrefix:
+    Type: String
+    Default: comprehension-gate
+    Description: SSM path (no leading slash) holding webhook-secret, github-app-private-key, openai-api-key
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+Globals:
+  Function:
+    Architectures: [x86_64]
+
+Resources:
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      BillingMode: PROVISIONED  # inside the always-free 25 RCU / 25 WCU
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+
+  JobsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+
+  JobsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      VisibilityTimeout: 960  # longer than the worker timeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt JobsDLQ.Arn
+        maxReceiveCount: 2
+
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../service/
+      Handler: webhook.handler
+      Runtime: python3.12
+      MemorySize: 512  # more CPU: keeps cold starts well under GitHub's 10 s limit
+      Timeout: 10
+      FunctionUrlConfig:
+        AuthType: NONE  # GitHub cannot sign AWS requests; the handler verifies the webhook HMAC
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref JobsQueue
+          WEBHOOK_SECRET_PARAM: !Sub /${ParamPrefix}/webhook-secret
+          BOT_LOGIN: !Ref BotLogin
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt JobsQueue.QueueName
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub ${ParamPrefix}/webhook-secret
+
+  # Public Function URLs also need lambda:InvokeFunction for calls made through the URL.
+  WebhookUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WebhookFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  WebhookLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${WebhookFunction}
+      RetentionInDays: !Ref LogRetentionDays
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      MemorySize: 1024
+      Timeout: 900
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref StateTable
+          APP_ID: !Ref AppId
+          BOT_LOGIN: !Ref BotLogin
+          APP_PRIVATE_KEY_PARAM: !Sub /${ParamPrefix}/github-app-private-key
+          OPENAI_API_KEY_PARAM: !Sub /${ParamPrefix}/openai-api-key
+          GATE_PROVIDER: openai
+          OPENAI_BASE_URL: !Ref OpenAIBaseUrl
+          OPENAI_PROJECT_ID: !Ref OpenAIProjectId
+          MODEL_ID: !Ref ModelId
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StateTable
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub ${ParamPrefix}/github-app-private-key
+        - SSMParameterReadPolicy:
+            ParameterName: !Sub ${ParamPrefix}/openai-api-key
+      Events:
+        Jobs:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt JobsQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: 2
+    Metadata:
+      Dockerfile: deploy/Dockerfile
+      DockerContext: ..
+      DockerTag: worker
+
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${WorkerFunction}
+      RetentionInDays: !Ref LogRetentionDays
+
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A gate job failed twice and landed in the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt JobsDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  WebhookUrl:
+    Description: Paste this into the GitHub App's Webhook URL
+    Value: !GetAtt WebhookFunctionUrl.FunctionUrl
+  StateTableName:
+    Value: !Ref StateTable
+  DeadLetterQueueUrl:
+    Value: !Ref JobsDLQ

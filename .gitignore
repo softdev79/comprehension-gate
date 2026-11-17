@@ -1,0 +1,19 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.idea/
+.claude/worktrees/
+
+# Local secrets. Never commit these.
+.env
+.env.*
+!.env.example
+
+# SAM build output and saved deploy answers (may include parameter values)
+.aws-sam/
+samconfig.toml
+
+# Accidental virtualenv created by an unexpanded %USERPROFILE% path
+/%USERPROFILE%/
+*-venv/
