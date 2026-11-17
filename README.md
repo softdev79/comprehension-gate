@@ -21,6 +21,28 @@ by people who cannot explain it.
 Make `comprehension-gate` a required status check in branch protection and the merge button
 stays disabled until step 4.
 
+## See it in action
+
+From a live run of the GitHub App deployment on a test repository: a pull request that adds
+loyalty points to a small shop module.
+
+**1. The agent reads the change and posts code-specific questions.** It found the boundary
+case where points earned exactly 365 days ago expire, and that a negative order total is not
+rejected. The link opens `answers.md` in GitHub's editor on the PR branch.
+
+![The gate's comment listing three questions about the loyalty-points change](docs/images/questionnaire-comment.webp)
+
+**2. Answers are graded when they are pushed.** Here the file was committed with no answers,
+so the deterministic policy fails it without spending a model call and lists what is missing.
+
+![Grade comment: score 0%, every question unanswered, gate still closed](docs/images/grade-not-passed.png)
+
+**3. The PR shows the gate's commit statuses.** `comprehension-gate/graded` carries the score
+and `comprehension-gate` stays failing until the author passes and signs. Make
+`comprehension-gate` a required check and the merge button stays disabled.
+
+![Merge status panel with comprehension-gate and comprehension-gate/graded failing](docs/images/merge-status.webp)
+
 ## Layout
 
 | Path | What it is |
